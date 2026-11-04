@@ -1,16 +1,19 @@
 """
-把 Chinese-CLIP RN50（MIT，https://github.com/OFA-Sys/Chinese-CLIP）导出成手机上用的 ONNX：
+把 Chinese-CLIP（MIT，https://github.com/OFA-Sys/Chinese-CLIP）导出成手机上用的 ONNX。
+可选的几档模型见 MODELS，每档导出两个文件：
 
-  cnclip-rn50-img.onnx   图像编码器，输入 image [1,3,224,224] float32，输出 [1,1024]
-  cnclip-rn50-txt.onnx   文本编码器，输入 text  [1,52] int64，        输出 [1,1024]
+  <id>-img.onnx   图像编码器，输入 image [1,3,S,S] float32，输出 [1,dim]
+  <id>-txt.onnx   文本编码器，输入 text  [1,52] int64，     输出 [1,dim]
 
 批大小固定为 1：RN50 的注意力池化在导出时会把 batch 当常量，动态 batch 会算错。
 手机上本来也是一张一张算。
 
 两个都做 int8 动态量化，再与 fp32 原模型逐一对比余弦相似度，偏差过大就直接失败。
-最后写 manifest.json（文件名、字节数、sha256），App 下载后按它校验。
+最后写 manifest-<id>.json（文件名、字节数、sha256 和给用户看的说明），App 下载后按它校验。
+RN50 另外再写一份 manifest.json，给只认这个文件名的旧版 App。
+catalog.json（所有可选模型的列表）由 make_catalog.py 汇总。
 
-用法：python export_cnclip.py --out dist/
+用法：python export_cnclip.py --model RN50 --out dist/
 """
 import argparse
 import hashlib
@@ -29,9 +32,23 @@ import cn_clip.clip as clip
 from cn_clip.clip import load_from_name
 from cn_clip.clip.model import AttentionPool2d
 
-MODEL_ID = "cnclip-rn50"
-VERSION = 1
 CONTEXT = 52
+
+# 给用户选的几档。minRamMb：建议的手机内存下限（App 用来标“推荐”和提醒）
+MODELS = {
+    "RN50": dict(
+        id="cnclip-rn50", version=1, order=0, title="轻快",
+        summary="体积最小、速度最快，适合大多数手机", minRamMb=0,
+    ),
+    "ViT-B-16": dict(
+        id="cnclip-vit-b-16", version=1, order=1, title="均衡",
+        summary="识别更准，整理照片稍慢，建议 6GB 以上内存", minRamMb=6 * 1024,
+    ),
+    "ViT-L-14": dict(
+        id="cnclip-vit-l-14", version=1, order=2, title="精准",
+        summary="识别最准，体积大、整理照片慢，建议 8GB 以上内存的旗舰机", minRamMb=8 * 1024,
+    ),
+}
 
 
 class ImageEncoder(torch.nn.Module):
@@ -87,39 +104,45 @@ def cos(a, b):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="RN50", choices=sorted(MODELS))
     ap.add_argument("--out", required=True)
     ap.add_argument("--cache", default=os.path.expanduser("~/.cache/cnclip"))
     args = ap.parse_args()
+    meta = MODELS[args.model]
+    model_id = meta["id"]
+    is_resnet = args.model.startswith("RN")
     os.makedirs(args.out, exist_ok=True)
-    tmp = os.path.join(args.out, "_fp32")
+    tmp = os.path.join(args.out, "_fp32-" + model_id)
     os.makedirs(tmp, exist_ok=True)
 
     try:
-        model, _ = load_from_name("RN50", device="cpu", download_root=args.cache)
+        model, _ = load_from_name(args.model, device="cpu", download_root=args.cache)
     except Exception as e:  # Hugging Face 不可用时退到 ModelScope
         print("HF download failed, trying ModelScope:", e)
-        model, _ = load_from_name("RN50", device="cpu", download_root=args.cache, use_modelscope=True)
+        model, _ = load_from_name(args.model, device="cpu", download_root=args.cache, use_modelscope=True)
     model.eval()
+    size = int(getattr(model.visual, "input_resolution", 224))
 
     rng = np.random.default_rng(0)
     # 低频噪声 + 少量高频细节：统计上比纯白噪声更像真实照片（已归一化的输入）
     coarse = torch.from_numpy(rng.normal(0, 1, (6, 3, 14, 14)).astype(np.float32))
-    imgs = torch.nn.functional.interpolate(coarse, size=224, mode="bicubic", align_corners=False)
+    imgs = torch.nn.functional.interpolate(coarse, size=size, mode="bicubic", align_corners=False)
     imgs = (imgs + 0.15 * torch.randn(imgs.shape, generator=torch.Generator().manual_seed(0))).numpy()
     texts = ["一只猫", "海边的日落", "城市夜景", "生日蛋糕", "Sunset at the BEACH!"]
     toks = clip.tokenize(texts, context_length=CONTEXT).numpy()
     with torch.no_grad():
         ref_img = model.encode_image(torch.from_numpy(imgs)).numpy()
         ref_txt = model.encode_text(torch.from_numpy(toks)).numpy()
-        AttentionPool2d.forward = attnpool_for_export
-        patched = model.encode_image(torch.from_numpy(imgs)).numpy()
-    print(f"patched attnpool vs original: min cosine {cos(patched, ref_img).min():.6f}")
-    if cos(patched, ref_img).min() < 0.9999:
-        raise SystemExit("patched attention pooling does not match the original")
+        if is_resnet:  # 只有 RN 系列用注意力池化，ViT 不需要这个补丁
+            AttentionPool2d.forward = attnpool_for_export
+            patched = model.encode_image(torch.from_numpy(imgs)).numpy()
+            print(f"patched attnpool vs original: min cosine {cos(patched, ref_img).min():.6f}")
+            if cos(patched, ref_img).min() < 0.9999:
+                raise SystemExit("patched attention pooling does not match the original")
 
     img_fp32 = os.path.join(tmp, "img.onnx")
     txt_fp32 = os.path.join(tmp, "txt.onnx")
-    dummy_img = torch.zeros(1, 3, 224, 224)
+    dummy_img = torch.zeros(1, 3, size, size)
     dummy_txt = clip.tokenize(["一只猫"], context_length=CONTEXT)
     with torch.no_grad():
         torch.onnx.export(ImageEncoder(model), (dummy_img,), img_fp32, input_names=["image"],
@@ -127,8 +150,8 @@ def main():
         torch.onnx.export(TextEncoder(model), (dummy_txt,), txt_fp32, input_names=["text"],
                           output_names=["embedding"], opset_version=14, do_constant_folding=True, dynamo=False)
 
-    img_q = os.path.join(args.out, f"{MODEL_ID}-img.onnx")
-    txt_q = os.path.join(args.out, f"{MODEL_ID}-txt.onnx")
+    img_q = os.path.join(args.out, f"{model_id}-img.onnx")
+    txt_q = os.path.join(args.out, f"{model_id}-txt.onnx")
     # ---- 校验：ONNX 与 PyTorch 原模型的输出必须足够接近 ----
 
     def run(path, name, x):
@@ -175,7 +198,7 @@ def main():
     print("nearest-text ref/int8:", ref_rank.tolist(), q_rank.tolist())
 
     # 分词向量：App 里的 Kotlin 分词器测试可以对照这份输出
-    with open(os.path.join(args.out, "tokenizer-check.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.out, f"tokenizer-check-{model_id}.json"), "w", encoding="utf-8") as f:
         json.dump([{"text": t, "ids": [int(v) for v in row if v != 0]} for t, row in zip(texts, toks)],
                   f, ensure_ascii=False, indent=1)
 
@@ -184,19 +207,26 @@ def main():
         files.append({"name": os.path.basename(p), "bytes": os.path.getsize(p), "sha256": sha256(p)})
         print(f"{os.path.basename(p)}: {os.path.getsize(p) / 1e6:.1f} MB")
     manifest = {
-        "id": MODEL_ID,
-        "version": VERSION,
+        "id": model_id,
+        "version": meta["version"],
+        "order": meta["order"],
+        "title": meta["title"],
+        "summary": meta["summary"],
+        "minRamMb": meta["minRamMb"],
         "dim": int(ref_img.shape[-1]),
-        "imageSize": 224,
+        "imageSize": size,
         "contextLength": CONTEXT,
         "mean": [0.48145466, 0.4578275, 0.40821073],
         "std": [0.26862954, 0.26130258, 0.27577711],
         "license": "Chinese-CLIP (MIT) https://github.com/OFA-Sys/Chinese-CLIP",
         "files": files,
     }
-    with open(os.path.join(args.out, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=1)
-    print(json.dumps(manifest, indent=1))
+    names = [f"manifest-{model_id}.json"] + (["manifest.json"] if model_id == "cnclip-rn50" else [])
+    for name in names:
+        with open(os.path.join(args.out, name), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=1)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(json.dumps(manifest, ensure_ascii=False, indent=1))
 
 
 if __name__ == "__main__":

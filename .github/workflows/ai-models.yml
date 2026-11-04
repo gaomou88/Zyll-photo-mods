@@ -1,7 +1,7 @@
 name: AI models
 
-# 导出端侧 AI 模型（Chinese-CLIP RN50 → int8 ONNX），校验后发布到本仓库的 Release。
-# Zyll 相册 GitHub 版从 Release 按需下载，Play 版打包前用它填资源包。
+# 导出几档端侧 AI 模型（Chinese-CLIP → int8 ONNX），校验后发布到本仓库的 Release。
+# Zyll 相册 GitHub 版从 Release 按需下载，用户按自己手机选一档；Play 版打包前用它填资源包。
 on:
   push:
     paths:
@@ -17,9 +17,29 @@ on:
 permissions:
   contents: write
 
+env:
+  TAG: ${{ inputs.tag || 'ai-models-v1' }}
+
 jobs:
-  export:
+  release:
     runs-on: ubuntu-latest
+    steps:
+      - name: 准备 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "端侧 AI 模型 ($TAG)" \
+              --notes "Chinese-CLIP（MIT，https://github.com/OFA-Sys/Chinese-CLIP）int8 ONNX，供 Zyll 相册按需下载。分轻快 / 均衡 / 精准三档，用户在 App 里按手机自行选择。"
+
+  export:
+    needs: release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [RN50, ViT-B-16, ViT-L-14]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,13 +50,25 @@ jobs:
       - name: 安装依赖
         run: pip install -r tools/ai-models/requirements.txt
       - name: 导出并校验
-        run: python tools/ai-models/export_cnclip.py --out dist
-      - name: 发布到 Release
+        run: python tools/ai-models/export_cnclip.py --model "${{ matrix.model }}" --out dist
+      - name: 上传到 Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || 'ai-models-v1' }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" dist/*.onnx dist/manifest*.json --clobber
+
+  catalog:
+    needs: export
+    if: always() && needs.export.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 汇总模型列表
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --target "$GITHUB_SHA" --title "端侧 AI 模型 ($TAG)" \
-              --notes "Chinese-CLIP RN50（MIT，https://github.com/OFA-Sys/Chinese-CLIP）int8 ONNX，供 Zyll 相册按需下载。不包含在安装包里。"
-          gh release upload "$TAG" dist/*.onnx dist/manifest.json --clobber
+          mkdir -p dist
+          gh release download "$TAG" --dir dist --pattern 'manifest-*.json'
+          python3 tools/ai-models/make_catalog.py dist
+          gh release upload "$TAG" dist/catalog.json --clobber
