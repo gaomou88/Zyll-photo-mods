@@ -1,0 +1,42 @@
+name: AI models
+
+# 导出端侧 AI 模型（Chinese-CLIP RN50 → int8 ONNX），校验后发布到本仓库的 Release。
+# Zyll 相册 GitHub 版从 Release 按需下载，Play 版打包前用它填资源包。
+on:
+  push:
+    paths:
+      - "tools/ai-models/**"
+      - ".github/workflows/ai-models.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag"
+        default: "ai-models-v1"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: tools/ai-models/requirements.txt
+      - name: 安装依赖
+        run: pip install -r tools/ai-models/requirements.txt
+      - name: 导出并校验
+        run: python tools/ai-models/export_cnclip.py --out dist
+      - name: 发布到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || 'ai-models-v1' }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "端侧 AI 模型 ($TAG)" \
+              --notes "Chinese-CLIP RN50（MIT，https://github.com/OFA-Sys/Chinese-CLIP）int8 ONNX，供 Zyll 相册按需下载。不包含在安装包里。"
+          gh release upload "$TAG" dist/*.onnx dist/manifest.json --clobber
