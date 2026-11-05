@@ -1,0 +1,40 @@
+name: Editor models
+
+# 下载修图用的 AI 模型（魔术橡皮擦：MI-GAN、LaMa），逐个功能校验后发布到本仓库的 Release。
+# Zyll 相册在编辑页里列出这些模型，用户自己选一个下载。
+on:
+  push:
+    paths:
+      - "tools/editor-models/**"
+      - ".github/workflows/editor-models.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TAG: editor-models-v1
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: tools/editor-models/requirements.txt
+      - name: 安装依赖
+        run: pip install -r tools/editor-models/requirements.txt
+      - name: 下载并校验
+        run: python tools/editor-models/fetch_editor_models.py --out dist
+      - name: 发布到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "修图 AI 模型 ($TAG)" \
+              --notes "魔术橡皮擦模型，供 Zyll 相册编辑页按需下载：MI-GAN（MIT，Picsart AI Research）与 LaMa（Apache-2.0，Samsung AI Center）。"
+          gh release upload "$TAG" dist/*.onnx dist/editor-catalog.json --clobber
