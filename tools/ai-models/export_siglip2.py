@@ -13,7 +13,7 @@
   <id>-tokenizer.model  Gemma 的 SentencePiece 词表，App 里的 Kotlin 分词器直接读它
   manifest-<id>.json    文件清单、预处理参数、分词规则和几组分词对照（App 加载时自检）、OCR 参数
 
-两个编码器都做 int8 动态量化，再和 PyTorch 原模型逐一对比余弦相似度，偏差过大就失败。
+两个编码器都只压缩权重（先试 4 位、再试 fp16，激活保持 fp32），再和 PyTorch 原模型逐一对比余弦相似度，偏差过大就失败。
 另外用 sentencepiece 逐条对照 Hugging Face 的分词器（App 按 sentencepiece 的规则实现），不一致就失败。
 catalog.json（所有档位的列表）由 make_catalog.py 汇总。
 
@@ -35,7 +35,9 @@ import onnxruntime as ort
 import sentencepiece as spm
 import torch
 from huggingface_hub import hf_hub_download
+from onnx import numpy_helper
 from onnxruntime.quantization import QuantType, quantize_dynamic
+from onnxruntime.quantization.matmul_nbits_quantizer import DefaultWeightOnlyQuantConfig, MatMulNBitsQuantizer
 from PIL import Image
 from transformers import AutoModel, AutoProcessor
 
@@ -168,7 +170,6 @@ def export_onnx(module, args, path, input_name):
     finally:
         module.float()
     m = onnx.load(half, load_external_data=True)
-    from onnx import numpy_helper
     for init in m.graph.initializer:
         if init.data_type == onnx.TensorProto.FLOAT16:
             init.CopyFrom(numpy_helper.from_array(numpy_helper.to_array(init).astype(np.float32), init.name))
@@ -188,6 +189,49 @@ def export_onnx(module, args, path, input_name):
     onnx.save(m, path, save_as_external_data=True, all_tensors_to_one_file=True,
               location=os.path.basename(path) + ".data", size_threshold=1024)
     os.remove(half)
+
+
+def save_external(m, path):
+    for f in (path, path + ".data"):
+        if os.path.exists(f):
+            os.remove(f)
+    onnx.save(m, path, save_as_external_data=True, all_tensors_to_one_file=True,
+              location=os.path.basename(path) + ".data", size_threshold=1024)
+
+
+def weight_only_int4(src, dst, block, symmetric):
+    """只量化权重（MatMulNBits 4 位，按 block 个一块）：计算时激活仍是 fp32，误差只来自权重。
+    （8 位的 MatMulNBits 在 CPU 上只有连激活一起量化的算法，所以不用。）"""
+    cfg = DefaultWeightOnlyQuantConfig(block_size=block, is_symmetric=symmetric, accuracy_level=None, bits=4)
+    q = MatMulNBitsQuantizer(onnx.load(src, load_external_data=True), block_size=block, is_symmetric=symmetric, algo_config=cfg)
+    q.process()
+    save_external(q.model.model, dst)
+
+
+def gather_int8(src, dst):
+    """词表（Gather）按 int8 存：查表只是取一行再还原，没有激活量化的误差。"""
+    quantize_dynamic(src, dst, weight_type=QuantType.QInt8, per_channel=False, op_types_to_quantize=["Gather"],
+                     use_external_data_format=True)
+
+
+def weights_fp16(src, dst, min_elems=1024):
+    """权重按 fp16 存、加载时转回 fp32 计算：文件小一半，结果几乎不变（运行时内存和 fp32 一样）。"""
+    m = onnx.load(src, load_external_data=True)
+    g = m.graph
+    keep, casts = [], []
+    for init in g.initializer:
+        if init.data_type == onnx.TensorProto.FLOAT and int(np.prod(init.dims)) >= min_elems:
+            h = numpy_helper.from_array(numpy_helper.to_array(init).astype(np.float16), init.name + "__fp16")
+            keep.append(h)
+            casts.append(onnx.helper.make_node("Cast", [h.name], [init.name], to=onnx.TensorProto.FLOAT, name=init.name + "__cast"))
+        else:
+            keep.append(init)
+    del g.initializer[:]
+    g.initializer.extend(keep)
+    nodes = casts + list(g.node)
+    del g.node[:]
+    g.node.extend(nodes)
+    save_external(m, dst)
 
 
 def random_texts(n, seed=1):
@@ -308,66 +352,40 @@ def main():
     img_q = os.path.join(args.out, f"{model_id}-img.onnx")
     txt_q = os.path.join(args.out, f"{model_id}-txt.onnx")
 
-    def block_nodes(path, op_types, edge_blocks):
-        """op_types 里、属于前后 edge_blocks 个 Transformer 层或者池化头的节点名（这些层对量化最敏感）。"""
-        g = onnx.load(path, load_external_data=False).graph
-        layers = sorted({int(n.name.split("layers.")[1].split("/")[0]) for n in g.node if "layers." in n.name})
-        if not layers:
-            return []
-        keep = set(layers[:edge_blocks] + layers[-edge_blocks:])
-        out = []
-        for n in g.node:
-            if n.op_type not in op_types:
-                continue
-            if "layers." in n.name and int(n.name.split("layers.")[1].split("/")[0]) in keep:
-                out.append(n.name)
-            elif "/head/" in n.name:
-                out.append(n.name)
-        return out
-
-    # 量化：从最省空间的方案往下试，第一个够准的就用；都不够准就失败。
-    # 只量化“乘权重”的 MatMul（MatMulConstBOnly）：注意力里 Q·K、注意力·V 这种两个激活相乘的 MatMul
-    # 量化后误差很大（以前的版本就是因为这个在大图模型上只有 0.94～0.96），保持 fp32。
-    def quantize(src, dst, name, x, ref, label, allow_fp32):
-        mm = ["MatMul", "Gemm"]
+    # 压缩：从最省空间的方案往下试，第一个够准（和 PyTorch 原模型的余弦相似度最低 ≥ 0.98）的就用；都不够准就失败。
+    # 只压缩权重，不量化激活：SigLIP 2 的激活里有离群值，动态 int8（连激活一起量化）在真实照片上会掉到 0.6～0.9。
+    def quantize(src, dst, name, x, ref, label):
+        work = dst + ".work"
+        os.makedirs(work, exist_ok=True)
+        a, b = os.path.join(work, "a.onnx"), os.path.join(work, "b.onnx")
         attempts = [
-            # 连词表（Gather）一起量化：文本编码器里 256k 词表占了一大半
-            ("int8 matmul+gather", dict(op_types_to_quantize=mm + ["Gather"])),
-            ("int8 matmul", dict(op_types_to_quantize=mm)),
-            # x86 上没有 VNNI 时 u8×s8 可能溢出，缩小一位范围
-            ("int8 matmul reduce-range", dict(op_types_to_quantize=mm, reduce_range=True)),
-            ("int8 matmul, edge blocks fp32", dict(op_types_to_quantize=mm, nodes_to_exclude=block_nodes(src, mm, 2))),
+            ("int4 weights (block 32) + int8 vocab", lambda: (weight_only_int4(src, a, 32, True), gather_int8(a, b))[-1] or b),
+            ("int4 weights (block 16, asymmetric) + int8 vocab", lambda: (weight_only_int4(src, a, 16, False), gather_int8(a, b))[-1] or b),
+            ("fp16 weights + int8 vocab", lambda: (gather_int8(src, a), weights_fp16(a, b))[-1] or b),
+            ("fp16 weights", lambda: weights_fp16(src, b) or b),
         ]
-        tmp_q = dst + ".tmp.onnx"
-        for what, kw in attempts:
-            try:
-                for f in (tmp_q, tmp_q + ".data"):
-                    if os.path.exists(f):
-                        os.remove(f)
-                quantize_dynamic(src, tmp_q, weight_type=QuantType.QInt8, per_channel=True, use_external_data_format=True,
-                                 extra_options={"MatMulConstBOnly": True}, **kw)
-                if not save_single(tmp_q, dst):
-                    print(f"{label} {what}: still larger than 2GB")
+        try:
+            for what, make in attempts:
+                try:
+                    out = make()
+                    if not save_single(out, dst):
+                        print(f"{label} {what}: larger than 2GB, skipped")
+                        continue
+                    c = cos(run(dst, name, x), ref)
+                except Exception as e:  # noqa: BLE001
+                    print(f"{label} {what}: not usable ({type(e).__name__}: {e})")
                     continue
-                c = cos(run(dst, name, x), ref)
-            except Exception as e:  # noqa: BLE001
-                print(f"{label} {what}: not usable ({e})")
-                continue
-            print(f"{label} {what}: cosine vs torch min={c.min():.4f} mean={c.mean():.4f} size={os.path.getsize(dst) / 1e6:.1f} MB")
-            if c.min() >= 0.98:
-                for f in (tmp_q, tmp_q + ".data"):
-                    if os.path.exists(f):
-                        os.remove(f)
-                return what
-        # 不量化：只给图像编码器、而且要放得进一个资源包（大档的图像编码器放不下，那就失败）
-        if allow_fp32 and os.path.getsize(src) + (os.path.getsize(src + ".data") if os.path.exists(src + ".data") else 0) < PACK_LIMIT:
-            if save_single(src, dst):
-                print(f"{label}: no int8 variant is accurate enough, keeping fp32 ({os.path.getsize(dst) / 1e6:.1f} MB)")
-                return "fp32"
-        raise SystemExit(f"{label}: no int8 variant is accurate enough")
+                print(f"{label} {what}: cosine vs torch min={c.min():.4f} mean={c.mean():.4f} size={os.path.getsize(dst) / 1e6:.1f} MB")
+                if c.min() >= 0.98:
+                    if os.path.getsize(dst) >= PACK_LIMIT:
+                        raise SystemExit(f"{label}: {os.path.getsize(dst) / 1e6:.0f} MB does not fit in one Play asset pack")
+                    return what
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        raise SystemExit(f"{label}: no compressed variant is accurate enough")
 
-    img_how = quantize(img_fp32, img_q, "pixel_values", imgs, ref_img, "img", allow_fp32=True)
-    txt_how = quantize(txt_fp32, txt_q, "input_ids", toks, ref_txt, "txt", allow_fp32=False)
+    img_how = quantize(img_fp32, img_q, "pixel_values", imgs, ref_img, "img")
+    txt_how = quantize(txt_fp32, txt_q, "input_ids", toks, ref_txt, "txt")
     print("quantization: img", img_how, "/ txt", txt_how)
 
     # 量化后文字和图片之间的相对排序应保持一致
@@ -375,7 +393,7 @@ def main():
     q_txt = run(txt_q, "input_ids", toks)
     ref_rank = np.argsort(-cos(ref_txt[:, None, :], ref_img[None, :, :]), axis=1)[:, 0]
     q_rank = np.argsort(-cos(q_txt[:, None, :], q_img[None, :, :]), axis=1)[:, 0]
-    print("best image per text ref/int8:", ref_rank.tolist(), q_rank.tolist())
+    print("best image per text ref/compressed:", ref_rank.tolist(), q_rank.tolist())
 
     # ---- OCR ----
     with open(os.path.join(args.ocr, "ocr.json"), encoding="utf-8") as f:
