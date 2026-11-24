@@ -27,13 +27,16 @@ import os
 import random
 import shutil
 import tempfile
+import urllib.request
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import sentencepiece as spm
 import torch
 from huggingface_hub import hf_hub_download
 from onnxruntime.quantization import QuantType, quantize_dynamic
+from PIL import Image
 from transformers import AutoModel, AutoProcessor
 
 # 给用户选的几档。minRamMb：建议的手机内存下限（App 用来标“推荐”和提醒）
@@ -63,6 +66,22 @@ TOKENIZER_TESTS = [
 MIN_PROBABILITY = 1e-3
 # 离最高分多远就截断，单位是 logit（相当于以前 CLIP 用的 0.06 × 100）
 RELATIVE_LOGITS = 6.0
+
+
+# 量化校验用的几张真实照片（COCO val2017，Hugging Face 文档里常用的那几张）。下载不到就只用合成图
+REAL_IMAGES = [
+    "http://images.cocodataset.org/val2017/000000039769.jpg",  # 沙发上的两只猫
+    "http://images.cocodataset.org/val2017/000000000139.jpg",  # 客厅
+    "http://images.cocodataset.org/val2017/000000000285.jpg",  # 熊
+    "http://images.cocodataset.org/val2017/000000000632.jpg",  # 卧室
+    "http://images.cocodataset.org/val2017/000000000724.jpg",  # 停车标志
+    "http://images.cocodataset.org/val2017/000000000776.jpg",  # 泰迪熊
+]
+
+# 单个 ONNX 文件（protobuf）的上限
+PROTO_LIMIT = 2 * 1024 ** 3 - 64 * 1024 ** 2
+# Play 单个资源包放得下的最大文件（和 build_play_packs.py 的 PACK_LIMIT 一样）
+PACK_LIMIT = 1400 * 1024 * 1024
 
 
 def sha256(path):
@@ -95,6 +114,80 @@ class TextEncoder(torch.nn.Module):
 
     def forward(self, input_ids):
         return self.m.get_text_features(input_ids=input_ids)
+
+
+def real_images(size, mean, std, cache):
+    """和 App 一样：拉伸成正方形（双线性），(x/255 - mean)/std。"""
+    out = []
+    os.makedirs(cache, exist_ok=True)
+    for url in REAL_IMAGES:
+        path = os.path.join(cache, os.path.basename(url))
+        try:
+            if not os.path.isfile(path):
+                urllib.request.urlretrieve(url, path)
+            im = Image.open(path).convert("RGB").resize((size, size), Image.BILINEAR)
+        except Exception as e:  # noqa: BLE001
+            print(f"real image {url}: skipped ({e})")
+            continue
+        x = (np.asarray(im, np.float32).transpose(2, 0, 1) / 255.0 - np.array(mean, np.float32)[:, None, None]) / np.array(std, np.float32)[:, None, None]
+        out.append(x.astype(np.float32))
+    return np.stack(out) if out else None
+
+
+def save_single(src, dst):
+    """把（可能带外部数据的）ONNX 存成一个文件：App 只认单文件。放不下时返回 False。"""
+    m = onnx.load(src, load_external_data=True)
+    if m.ByteSize() > PROTO_LIMIT:
+        return False
+    for f in (dst, dst + ".data"):
+        if os.path.exists(f):
+            os.remove(f)
+    onnx.save(m, dst)
+    return True
+
+
+def export_onnx(module, args, path, input_name):
+    """导出到 path（大于 2GB 时权重放在旁边的外部数据文件里）。
+
+    torch 2.5 的老导出器遇到超过 2GB 的模型会直接报 protobuf 2GiB 的错，不会自动改用外部数据：
+    这时先用 fp16 权重导出（体积减半），再把权重转回 fp32、存成外部数据，后面照常按 fp32 校验和量化。"""
+    kw = dict(input_names=[input_name], output_names=["embedding"], opset_version=17, do_constant_folding=True, dynamo=False)
+    try:
+        with torch.no_grad():
+            torch.onnx.export(module, args, path, **kw)
+        return
+    except RuntimeError as e:
+        if "2GiB" not in str(e) and "2GB" not in str(e):
+            raise
+        print(f"{input_name}: larger than 2GB, exporting with fp16 weights and converting back to fp32 external data")
+    half = os.path.join(os.path.dirname(path), "half-" + os.path.basename(path))
+    module.half()
+    try:
+        with torch.no_grad():
+            torch.onnx.export(module, tuple(a.half() if a.is_floating_point() else a for a in args), half, **kw)
+    finally:
+        module.float()
+    m = onnx.load(half, load_external_data=True)
+    from onnx import numpy_helper
+    for init in m.graph.initializer:
+        if init.data_type == onnx.TensorProto.FLOAT16:
+            init.CopyFrom(numpy_helper.from_array(numpy_helper.to_array(init).astype(np.float32), init.name))
+    for node in m.graph.node:
+        if node.op_type == "Constant":
+            for a in node.attribute:
+                if a.t is not None and a.t.data_type == onnx.TensorProto.FLOAT16:
+                    a.t.CopyFrom(numpy_helper.from_array(numpy_helper.to_array(a.t).astype(np.float32)))
+        if node.op_type == "Cast":
+            for a in node.attribute:
+                if a.name == "to" and a.i == onnx.TensorProto.FLOAT16:
+                    a.i = onnx.TensorProto.FLOAT
+    for v in list(m.graph.input) + list(m.graph.output) + list(m.graph.value_info):
+        t = v.type.tensor_type
+        if t.elem_type == onnx.TensorProto.FLOAT16:
+            t.elem_type = onnx.TensorProto.FLOAT
+    onnx.save(m, path, save_as_external_data=True, all_tensors_to_one_file=True,
+              location=os.path.basename(path) + ".data", size_threshold=1024)
+    os.remove(half)
 
 
 def random_texts(n, seed=1):
@@ -177,6 +270,11 @@ def main():
     coarse = torch.from_numpy(rng.normal(0, 0.6, (6, 3, 14, 14)).astype(np.float32))
     imgs = torch.nn.functional.interpolate(coarse, size=size, mode="bicubic", align_corners=False)
     imgs = (imgs + 0.1 * torch.randn(imgs.shape, generator=torch.Generator().manual_seed(0))).clamp(-1, 1).numpy()
+    # 合成图之外再加几张真实照片：量化误差在真实照片上的表现才是 App 里遇到的
+    real = real_images(size, mean, std, os.path.join(args.cache or tmp, "real-images"))
+    if real is not None:
+        imgs = np.concatenate([imgs, real]).astype(np.float32)
+    print(f"accuracy check images: {len(imgs) - (0 if real is None else len(real))} synthetic + {0 if real is None else len(real)} real")
     texts = ["a photo of a cat", "海边的日落", "city at night", "生日蛋糕", "a dog playing in the snow", "收据"]
     toks = encode(texts)
     with torch.no_grad():
@@ -187,12 +285,12 @@ def main():
 
     img_fp32 = os.path.join(tmp, "img.onnx")
     txt_fp32 = os.path.join(tmp, "txt.onnx")
-    with torch.no_grad():
-        # 大模型超过 2GB 时 torch 会自动把权重写成外部数据文件
-        torch.onnx.export(ImageEncoder(model), (torch.zeros(1, 3, size, size),), img_fp32, input_names=["pixel_values"],
-                          output_names=["embedding"], opset_version=17, do_constant_folding=True, dynamo=False)
-        torch.onnx.export(TextEncoder(model), (torch.from_numpy(toks[:1]),), txt_fp32, input_names=["input_ids"],
-                          output_names=["embedding"], opset_version=17, do_constant_folding=True, dynamo=False)
+    export_onnx(ImageEncoder(model), (torch.zeros(1, 3, size, size),), img_fp32, "pixel_values")
+    export_onnx(TextEncoder(model), (torch.from_numpy(toks[:1]),), txt_fp32, "input_ids")
+    # 导出完就不需要 PyTorch 模型了，放掉省内存（大档的量化要再占好几 GB）
+    del model
+    import gc
+    gc.collect()
 
     def run(path, name, x):
         s = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
@@ -210,30 +308,67 @@ def main():
     img_q = os.path.join(args.out, f"{model_id}-img.onnx")
     txt_q = os.path.join(args.out, f"{model_id}-txt.onnx")
 
-    # 量化：从最省空间的方案往下试，第一个够准的就用；都不够准就失败（fp32 太大，手机上跑不动）
-    def quantize(src, dst, name, x, ref, label):
+    def block_nodes(path, op_types, edge_blocks):
+        """op_types 里、属于前后 edge_blocks 个 Transformer 层或者池化头的节点名（这些层对量化最敏感）。"""
+        g = onnx.load(path, load_external_data=False).graph
+        layers = sorted({int(n.name.split("layers.")[1].split("/")[0]) for n in g.node if "layers." in n.name})
+        if not layers:
+            return []
+        keep = set(layers[:edge_blocks] + layers[-edge_blocks:])
+        out = []
+        for n in g.node:
+            if n.op_type not in op_types:
+                continue
+            if "layers." in n.name and int(n.name.split("layers.")[1].split("/")[0]) in keep:
+                out.append(n.name)
+            elif "/head/" in n.name:
+                out.append(n.name)
+        return out
+
+    # 量化：从最省空间的方案往下试，第一个够准的就用；都不够准就失败。
+    # 只量化“乘权重”的 MatMul（MatMulConstBOnly）：注意力里 Q·K、注意力·V 这种两个激活相乘的 MatMul
+    # 量化后误差很大（以前的版本就是因为这个在大图模型上只有 0.94～0.96），保持 fp32。
+    def quantize(src, dst, name, x, ref, label, allow_fp32):
+        mm = ["MatMul", "Gemm"]
         attempts = [
             # 连词表（Gather）一起量化：文本编码器里 256k 词表占了一大半
-            ("int8 matmul+gather", dict(weight_type=QuantType.QInt8, per_channel=True,
-                                        op_types_to_quantize=["MatMul", "Gemm", "Gather"])),
-            ("int8 matmul-only", dict(weight_type=QuantType.QInt8, per_channel=True, op_types_to_quantize=["MatMul", "Gemm"])),
-            # ORT 的 ConvInteger 只支持 uint8 权重
-            ("uint8 all", dict(weight_type=QuantType.QUInt8, per_channel=False)),
+            ("int8 matmul+gather", dict(op_types_to_quantize=mm + ["Gather"])),
+            ("int8 matmul", dict(op_types_to_quantize=mm)),
+            # x86 上没有 VNNI 时 u8×s8 可能溢出，缩小一位范围
+            ("int8 matmul reduce-range", dict(op_types_to_quantize=mm, reduce_range=True)),
+            ("int8 matmul, edge blocks fp32", dict(op_types_to_quantize=mm, nodes_to_exclude=block_nodes(src, mm, 2))),
         ]
+        tmp_q = dst + ".tmp.onnx"
         for what, kw in attempts:
             try:
-                quantize_dynamic(src, dst, use_external_data_format=False, **kw)
+                for f in (tmp_q, tmp_q + ".data"):
+                    if os.path.exists(f):
+                        os.remove(f)
+                quantize_dynamic(src, tmp_q, weight_type=QuantType.QInt8, per_channel=True, use_external_data_format=True,
+                                 extra_options={"MatMulConstBOnly": True}, **kw)
+                if not save_single(tmp_q, dst):
+                    print(f"{label} {what}: still larger than 2GB")
+                    continue
                 c = cos(run(dst, name, x), ref)
             except Exception as e:  # noqa: BLE001
                 print(f"{label} {what}: not usable ({e})")
                 continue
             print(f"{label} {what}: cosine vs torch min={c.min():.4f} mean={c.mean():.4f} size={os.path.getsize(dst) / 1e6:.1f} MB")
             if c.min() >= 0.98:
-                return
+                for f in (tmp_q, tmp_q + ".data"):
+                    if os.path.exists(f):
+                        os.remove(f)
+                return what
+        # 不量化：只给图像编码器、而且要放得进一个资源包（大档的图像编码器放不下，那就失败）
+        if allow_fp32 and os.path.getsize(src) + (os.path.getsize(src + ".data") if os.path.exists(src + ".data") else 0) < PACK_LIMIT:
+            if save_single(src, dst):
+                print(f"{label}: no int8 variant is accurate enough, keeping fp32 ({os.path.getsize(dst) / 1e6:.1f} MB)")
+                return "fp32"
         raise SystemExit(f"{label}: no int8 variant is accurate enough")
 
-    quantize(img_fp32, img_q, "pixel_values", imgs, ref_img, "img")
-    quantize(txt_fp32, txt_q, "input_ids", toks, ref_txt, "txt")
+    img_how = quantize(img_fp32, img_q, "pixel_values", imgs, ref_img, "img", allow_fp32=True)
+    txt_how = quantize(txt_fp32, txt_q, "input_ids", toks, ref_txt, "txt", allow_fp32=False)
+    print("quantization: img", img_how, "/ txt", txt_how)
 
     # 量化后文字和图片之间的相对排序应保持一致
     q_img = run(img_q, "pixel_values", imgs)
